@@ -20,6 +20,7 @@ defmodule ExPTY do
     :pty,
     :on_data,
     :on_exit,
+    :on_read_closed,
     :echo?,
 
     # unix
@@ -61,6 +62,7 @@ defmodule ExPTY do
       on_data: nil,
       on_exit: nil,
       drain_on_exit: false,
+      on_read_closed: nil,
       echo?: Application.get_env(:expty, :echo?, false),
       encoding: Application.get_env(:expty, :encoding, "utf-8"),
       handle_flow_control: Application.get_env(:expty, :handle_flow_control, false),
@@ -186,6 +188,18 @@ defmodule ExPTY do
     callback has run. Defaults to `false`, which reports process exit without
     waiting for the reader. Background descendants can keep the PTY open after
     the original process exits. This option is not supported on Windows.
+
+  - `on_read_closed`: `(module(), pid(), :eof | {:error, integer()} -> term()) | module()`
+
+    Called once after the Unix reader's final output callback. A clean PTY
+    closure reports `:eof`; an unexpected read or select failure reports its
+    POSIX error number. A module callback must export `on_read_closed/3`.
+    Defaults to `nil`. This callback is not supported on Windows.
+
+    Process exit and output completion are separate events. A descendant can
+    keep the PTY open after the spawned process exits; applications waiting for
+    both events must bound that wait and handle failure explicitly.
+    This callback does not add a process-lifetime or cleanup policy.
 
   - `encoding`: `String.t()`
 
@@ -378,6 +392,8 @@ defmodule ExPTY do
       raise ArgumentError, "drain_on_exit must be a boolean"
     end
 
+    on_read_closed = normalize_callback(options[:on_read_closed], :on_read_closed, 3)
+
     init_pack =
       case :os.type() do
         {os_type = :unix, _} ->
@@ -439,7 +455,8 @@ defmodule ExPTY do
             flow_control_resume,
             on_data,
             on_exit,
-            drain_on_exit
+            drain_on_exit,
+            on_read_closed
           }
 
         {os_type = :win32, _} ->
@@ -480,7 +497,7 @@ defmodule ExPTY do
         state =
           {os_type = :unix, file, args, env, cwd, cols, rows, ibaudrate, obaudrate, uid, gid,
            is_utf8, close_fds, echo?, helper_path, handle_flow_control, flow_control_pause,
-           flow_control_resume, on_data, on_exit, drain_on_exit}
+           flow_control_resume, on_data, on_exit, drain_on_exit, on_read_closed}
       ) do
     ret =
       ExPTY.Nif.spawn_unix(
@@ -516,6 +533,7 @@ defmodule ExPTY do
            on_exit: on_exit,
            drain_on_exit: drain_on_exit,
            output_closed: false,
+           on_read_closed: on_read_closed,
            echo?: echo?
          }}
 
@@ -719,6 +737,29 @@ defmodule ExPTY do
   end
 
   def handle_info(:output_closed, state), do: {:noreply, state}
+
+  @impl true
+  def handle_info({:read_closed, result}, %T{on_read_closed: callback} = state) do
+    case callback do
+      {:module, module} -> module.on_read_closed(__MODULE__, self(), result)
+      {:func, func} -> func.(__MODULE__, self(), result)
+      _ -> nil
+    end
+
+    case result do
+      :eof when state.drain_on_exit ->
+        maybe_notify_drained_exit(%{state | output_closed: true})
+
+      :eof ->
+        {:noreply, state}
+
+      {:error, reason} ->
+        {:stop, {:pty_reader_failed, reason}, state}
+    end
+  end
+
+  def handle_info({:wait_error, reason}, state),
+    do: {:stop, {:pty_wait_failed, reason}, state}
 
   defp maybe_notify_drained_exit(%T{output_closed: true, exit_status: {code, signal}} = state) do
     notify_exit(state, code, signal)

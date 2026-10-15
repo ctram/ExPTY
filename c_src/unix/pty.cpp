@@ -659,6 +659,7 @@ pty_pipesocket_fn(void *data) {
 
   int fd = pipesocket->fd;
   int activity;
+  int reader_error = 0;
 
   while (!pipesocket->fd_closed) {
     fd_set readfds;
@@ -670,6 +671,7 @@ pty_pipesocket_fn(void *data) {
       if (errno == EINTR) {
         continue;
       }
+      reader_error = errno;
       pipesocket->fd_closed = true;
       close(fd);
       pty_kill_process_group(pipesocket->pid, SIGHUP);
@@ -691,6 +693,11 @@ pty_pipesocket_fn(void *data) {
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
           continue;
         }
+        reader_error = errno;
+#if defined(__linux__)
+        // Linux reports PTY slave closure as EIO after buffered output drains.
+        if (reader_error == EIO) reader_error = 0;
+#endif
         pipesocket->fd_closed = true;
         close(fd);
         pty_kill_process_group(pipesocket->pid, SIGHUP);
@@ -708,16 +715,26 @@ pty_pipesocket_fn(void *data) {
           nif::atom(msg_env, "data"),
           dataread
         ));
+      } else {
+        reader_error = ENOMEM;
+        enif_free_env(msg_env);
+        pipesocket->fd_closed = true;
+        close(fd);
+        break;
       }
 
       enif_free_env(msg_env);
     }
   }
 
-  // The reader sends this after its last data message. Process status comes
-  // from a different thread and can arrive before the final output.
+  // Reader completion follows its final data send. Process exit is independent
+  // and can arrive before the final output or before descendants close the PTY.
   ErlNifEnv *msg_env = enif_alloc_env();
-  enif_send(NULL, &pipesocket->process, msg_env, nif::atom(msg_env, "output_closed"));
+  ERL_NIF_TERM result = reader_error == 0
+    ? nif::atom(msg_env, "eof")
+    : enif_make_tuple2(msg_env, nif::atom(msg_env, "error"), enif_make_int(msg_env, reader_error));
+  enif_send(NULL, &pipesocket->process, msg_env, enif_make_tuple2(msg_env,
+    nif::atom(msg_env, "read_closed"), result));
   enif_free_env(msg_env);
 
   enif_release_resource((void *)pipesocket);
@@ -781,16 +798,25 @@ size_t pty_pipesocket::write(void * data, size_t len) {
 
 static void *pty_waitpid(void *data) {
   int ret;
-  int stat_loc;
+  int stat_loc = 0;
 
   pty_baton *baton = static_cast<pty_baton*>(data);
 
   errno = 0;
 
-  if ((ret = waitpid(baton->pid, &stat_loc, 0)) != baton->pid) {
-    if (ret == -1 && errno == EINTR) {
-      return pty_waitpid(baton);
-    }
+  do {
+    ret = waitpid(baton->pid, &stat_loc, 0);
+  } while (ret == -1 && errno == EINTR);
+
+  if (ret != baton->pid) {
+    int wait_error = errno;
+    ErlNifEnv *msg_env = enif_alloc_env();
+    enif_send(NULL, &baton->process, msg_env, enif_make_tuple2(msg_env,
+      nif::atom(msg_env, "wait_error"), enif_make_int(msg_env, wait_error)));
+    enif_free_env(msg_env);
+    processes->erase(baton->pid);
+    delete baton;
+    return nullptr;
   }
 
   if (WIFEXITED(stat_loc)) {

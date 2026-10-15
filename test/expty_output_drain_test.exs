@@ -59,6 +59,22 @@ defmodule ExPTY.OutputDrainTest do
     end
   end
 
+  test "reader failure cannot publish the command's successful status" do
+    state = callback_state(drain_on_exit: true)
+    assert {:noreply, state} = ExPTY.handle_info({:exit, 0, 0}, state)
+
+    assert {:stop, {:pty_reader_failed, 5}, _} =
+             ExPTY.handle_info({:read_closed, {:error, 5}}, state)
+
+    refute_receive {:exit, _, _}, 0
+  end
+
+  test "a native wait failure cannot publish successful completion" do
+    state = callback_state(drain_on_exit: true)
+    assert {:stop, {:pty_wait_failed, 5}, _} = ExPTY.handle_info({:wait_error, 5}, state)
+    refute_receive {:exit, _, _}, 0
+  end
+
   defp callback_state(options) do
     owner = self()
 
